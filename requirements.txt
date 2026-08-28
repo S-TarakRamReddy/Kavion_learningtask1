@@ -1,0 +1,6 @@
+gradio
+pandas
+matplotlib
+groq
+python-dotenv
+tabulate

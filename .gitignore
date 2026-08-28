@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.gradio/
+temp_plots/
+exports/
+pandasai.log
+scratch/
