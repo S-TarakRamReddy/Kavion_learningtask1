@@ -135,13 +135,88 @@ def ask_data_agent(
 
     pai_df = pai.DataFrame(df)
 
+    import time
+    import contextlib
+    import uuid
+    from pandasai.agent.base import Agent
+    from core.analysis.sql_logger import SqlLogger
+
+    sql_logger = SqlLogger()
+
+    @contextlib.contextmanager
+    def patch_agent_execute_sql(current_question: str, req_id: str, logs: list, captured: list):
+        original_execute = Agent._execute_sql_query
+        
+        query_counter = {"index": 0}
+
+        def patched_execute(self, query: str):
+            query_counter["index"] += 1
+            current_index = query_counter["index"]
+            start_time = time.perf_counter()
+            status = "success"
+            error_message = None
+            rows_returned = None
+            try:
+                res = original_execute(self, query)
+                if isinstance(res, pd.DataFrame):
+                    rows_returned = len(res)
+                    captured.append({
+                        "dataframe": res,
+                        "sql": query,
+                        "request_id": req_id,
+                        "query_index": current_index
+                    })
+                return res
+            except Exception as e:
+                status = "failed"
+                error_message = str(e)
+                raise
+            finally:
+                end_time = time.perf_counter()
+                execution_time_ms = int((end_time - start_time) * 1000)
+                logs.append({
+                    "request_id": req_id,
+                    "question": current_question,
+                    "sql": query,
+                    "status": status,
+                    "execution_time_ms": execution_time_ms,
+                    "rows_returned": rows_returned,
+                    "error_message": error_message
+                })
+
+        Agent._execute_sql_query = patched_execute
+        try:
+            yield
+        finally:
+            Agent._execute_sql_query = original_execute
+
     # --------------------------------------------------------
     # Let PandasAI perform the analysis
     # --------------------------------------------------------
 
-    pandasai_result = pai_df.chat(
-        question
-    )
+    request_id = str(uuid.uuid4())
+    pending_logs = []
+    captured_dfs = []
+    visualization_requested = False
+
+    try:
+        with patch_agent_execute_sql(question, request_id, pending_logs, captured_dfs):
+            pandasai_result = pai_df.chat(question)
+        
+        if isinstance(pandasai_result, ChartResponse):
+            visualization_requested = True
+    finally:
+        for log_entry in pending_logs:
+            sql_logger.log_query(
+                request_id=log_entry["request_id"],
+                question=log_entry["question"],
+                sql=log_entry["sql"],
+                status=log_entry["status"],
+                execution_time_ms=log_entry["execution_time_ms"],
+                rows_returned=log_entry["rows_returned"],
+                visualization_requested=visualization_requested,
+                error_message=log_entry["error_message"]
+            )
 
     # --------------------------------------------------------
     # Extract generated Python code
@@ -227,39 +302,6 @@ def ask_data_agent(
             analytical_result
         )
 
-        # ----------------------------------------------------
-        # ENHANCEMENT: Extract SQL queries if present
-        # This solves PandasAI's limitation of only storing
-        # the LAST dataframe in ChartResponse.data
-        # ----------------------------------------------------
-        
-        import sqlite3
-        import re
-
-        if generated_code and "SELECT" in generated_code.upper():
-            try:
-                conn = sqlite3.connect(':memory:')
-                df.to_sql('my_table', conn, index=False)
-                
-                queries = set()
-                for match in re.finditer(r'([\'"]{1,3})\s*(SELECT\b[\s\S]*?FROM[\s\S]*?)\1', generated_code, flags=re.IGNORECASE):
-                    queries.add(match.group(2).strip())
-                    
-                extra_data = []
-                for q in queries:
-                    q = re.sub(r'(?:table_[a-z0-9_]+|\{TABLE_NAME\})', 'my_table', q, flags=re.IGNORECASE)
-                    try:
-                        res_df = pd.read_sql_query(q, conn)
-                        extra_data.append(res_df.to_markdown(index=False))
-                    except Exception:
-                        pass
-                
-                if extra_data:
-                    formatted_result = "Main Data:\n" + formatted_result + "\n\nAdditional Aggregations Extracted:\n" + "\n\n".join(extra_data)
-            except Exception:
-                pass
-
-
     # ========================================================
     # NORMAL DATA RESPONSE
     # ========================================================
@@ -275,6 +317,33 @@ def ask_data_agent(
         formatted_result = format_result(
             analytical_result
         )
+
+        from core.analysis.visualizer import auto_visualize
+        chart_path = auto_visualize(analytical_result)
+
+    # ========================================================
+    # ENHANCEMENT: Append Captured DFs
+    # ========================================================
+    # Ensure the LLM sees ALL underlying data fetched from SQL,
+    # and auto-visualize if we don't have a chart yet.
+    
+    if captured_dfs:
+        df_strings = []
+        for c_res in captured_dfs:
+            cdf = c_res["dataframe"] if isinstance(c_res, dict) else c_res
+            if not cdf.empty:
+                prefix = ""
+                if isinstance(c_res, dict) and "query_index" in c_res:
+                    prefix = f"Query #{c_res['query_index']} Result:\n"
+                df_strings.append(prefix + cdf.to_markdown(index=False))
+        
+        if df_strings:
+            formatted_result = f"Main Result:\n{formatted_result}\n\nUnderlying Executed Data:\n" + "\n\n".join(df_strings)
+            
+        from core.analysis.visualizer import create_subplot_visualization
+        subplot_path = create_subplot_visualization(captured_dfs)
+        if subplot_path:
+            chart_path = subplot_path
 
     # ========================================================
     # GENERATE EXPLANATION
@@ -307,17 +376,8 @@ def ask_data_agent(
         answer,
         chart_path,
         generated_code,
+        pending_logs
     )
-    
-
-    print("\n==============================")
-    print("ASK_DATA_AGENT RETURN")
-    print("==============================")
-    print("ANSWER:")
-    print(answer)
-
-    print("\nCHART PATH:")
-    print(chart_path)
 
     print("\nCHART EXISTS:")
     print(

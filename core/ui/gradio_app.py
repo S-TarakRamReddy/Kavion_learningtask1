@@ -75,7 +75,7 @@ def run_agent(question):
 
     try:
 
-        answer, chart_path, code = ask_data_agent(
+        answer, chart_path, code, logs = ask_data_agent(
             question,
             current_dataframe
         )
@@ -92,7 +92,9 @@ def run_agent(question):
         else:
             plot_update = gr.update(value=None, visible=False)
 
-        return answer, plot_update, code
+        sql_text = "\n\n".join([f"-- Query {i+1} (Status: {log['status']}, Time: {log['execution_time_ms']}ms)\n{log['sql']}" for i, log in enumerate(logs)]) if logs else "-- No SQL generated."
+
+        return answer, plot_update, sql_text, code
 
     except Exception as e:
 
@@ -103,6 +105,7 @@ def run_agent(question):
 `{str(e)}`
 """,
             gr.update(value=None, visible=False),
+            "-- Error generating SQL.",
             ""
         )
 
@@ -171,11 +174,17 @@ Upload a dataset and ask questions using natural language.
             visible=False
         )
 
-        generated_code = gr.Code(
-            label="Generated Python",
-            language="python",
-            interactive=False
-        )
+        with gr.Accordion("Developer Details", open=False):
+            sql_queries = gr.Code(
+                label="SQL Queries Captured",
+                language="sql",
+                interactive=False
+            )
+            generated_code = gr.Code(
+                label="Generated Python",
+                language="python",
+                interactive=False
+            )
 
         ask_button.click(
             fn=run_agent,
@@ -183,6 +192,7 @@ Upload a dataset and ask questions using natural language.
             outputs=[
                 answer,
                 plot,
+                sql_queries,
                 generated_code
             ]
         )
